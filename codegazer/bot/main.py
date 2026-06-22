@@ -4,30 +4,93 @@ from dotenv import load_dotenv
 import hmac
 import hashlib
 import json
+import httpx
+import groq
 
 load_dotenv()
 
 app = FastAPI()
 
+# Get all keys
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 GITHUB_SECRET = os.getenv("GITHUB_SECRET", "")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+
+# Verify keys are loaded
+print("=" * 50)
+print("CHECKING KEYS...")
+print("=" * 50)
+print(f"✓ GITHUB_TOKEN: {'Loaded ✓' if GITHUB_TOKEN else 'MISSING ✗'}")
+print(f"✓ GITHUB_SECRET: {'Loaded ✓' if GITHUB_SECRET else 'NOT SET (disabled for testing)'}")
+print(f"✓ GROQ_API_KEY: {'Loaded ✓' if GROQ_API_KEY else 'MISSING ✗'}")
+print("=" * 50)
 
 @app.get("/")
 def read_root():
     return {
         "message": "Code Review Bot is running!",
-        "status": "healthy"
+        "status": "healthy",
+        "github_token_loaded": bool(GITHUB_TOKEN),
+        "groq_key_loaded": bool(GROQ_API_KEY)
     }
 
-# Function to verify the webhook is from GitHub (security)
-def verify_github_signature(payload_body, signature):
-    """
-    This checks if the message really came from GitHub.
+@app.get("/test-github")
+async def test_github():
+    """Test if our GitHub token works"""
+    headers = {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github.v3+json"
+    }
     
-    """
+    async with httpx.AsyncClient() as client:
+        response = await client.get(
+            "https://api.github.com/user",
+            headers=headers
+        )
+    
+    if response.status_code == 200:
+        user_data = response.json()
+        return {
+            "status": "success",
+            "message": "GitHub token works!",
+            "user": user_data.get("login"),
+            "name": user_data.get("name")
+        }
+    else:
+        return {
+            "status": "error",
+            "message": "GitHub token failed",
+            "error": response.text
+        }
+
+@app.get("/test-groq")
+def test_groq():
+    """Test if Groq API key works"""
+    try:
+        client = groq.Groq(api_key=GROQ_API_KEY)
+        response = client.chat.completions.create(
+            model="qwen/qwen3-32b",
+            max_tokens=100,
+            messages=[
+                {"role": "user", "content": "Say 'Groq is ready!' in one sentence."}
+            ]
+        )
+        return {
+            "status": "success",
+            "message": "Groq API works!",
+            "response": response.choices[0].message.content
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": str(e)
+        }
+
+def verify_github_signature(payload_body, signature):
+    """Verify GitHub webhook signature"""
     if not signature:
         return False
     
-    # Create a signature
     hash_object = hmac.new(
         GITHUB_SECRET.encode(),
         payload_body,
@@ -35,52 +98,178 @@ def verify_github_signature(payload_body, signature):
     )
     expected_signature = "sha256=" + hash_object.hexdigest()
     
-    # Compare
     return hmac.compare_digest(expected_signature, signature)
+
+
+async def get_pr_diff(owner: str, repo: str, pr_number: int) -> str:
+    """Get the code changes (diff) from a pull request"""
+    
+    headers = {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github.v3.diff"
+    }
+    
+    async with httpx.AsyncClient() as client:
+        response = await client.get(
+            f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}",
+            headers=headers
+        )
+    
+    if response.status_code == 200:
+        return response.text
+    else:
+        raise Exception(f"Failed to get diff: {response.text}")
+
+async def review_code_with_groq(code_diff: str) -> str:
+    """Send code diff to Groq and get review"""
+    
+    client = groq.Groq(api_key=GROQ_API_KEY)
+    
+    # IMPORTANT: Include the actual code_diff in the prompt!
+    prompt = f"""You are an expert code reviewer. Review this code diff and provide constructive feedback.
+
+Focus on:
+1. Bugs or potential errors
+2. Code style and readability
+3. Performance improvements
+4. Security issues
+5. Best practices
+
+Keep your review concise and precise  (5-8 points max).
+Format each point clearly.
+The review should not be very lengthy and should be orgaised.(should not provide unnecessary sentences just only the issues pointwise)
+Make the review as short as possible
+Code diff to review:
+```diff
+{code_diff}
+```
+
+Please provide your review:"""
+    
+    response = client.chat.completions.create(
+        model="qwen/qwen3-32b",
+        max_tokens=1000,
+        messages=[
+            {"role": "user", "content": prompt}
+        ]
+    )
+    
+    return response.choices[0].message.content
+
+async def post_review_comment(owner: str, repo: str, pr_number: int, review: str):
+    """Post the review as a comment on the PR"""
+    
+    headers = {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github.v3+json"
+    }
+    
+    comment_body = f"""🤖 **Automated Code Review**
+
+{review}
+
+---
+*This review was generated by Code Review Bot*"""
+    
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            f"https://api.github.com/repos/{owner}/{repo}/issues/{pr_number}/comments",
+            headers=headers,
+            json={"body": comment_body}
+        )
+    
+    if response.status_code == 201:
+        print(f"✓ Review posted on {owner}/{repo}#{pr_number}")
+        return True
+    else:
+        print(f"✗ Failed to post review: {response.text}")
+        return False
 
 @app.post("/webhook")
 async def receive_webhook(
     request: Request,
     x_hub_signature_256: str = Header(None)
 ):
-    """
-    This is called when GitHub sends a webhook.
+    """Handle GitHub webhook"""
     
-    Analogy:
-    - Doorbell rings = GitHub sends webhook
-    - You check who's at door = We verify signature
-    - You open door = We process the data
-    """
+    print("\n" + "🔔" * 30)
+    print("WEBHOOK RECEIVED!")
+    print("🔔" * 30)
     
-    # Get the raw data
     payload_body = await request.body()
     
-    # Verify it's really from GitHub
-    if not verify_github_signature(payload_body, x_hub_signature_256):
+    # SIGNATURE VERIFICATION - DISABLED FOR TESTING
+    # Uncomment this to enable signature verification
+    # if not verify_github_signature(payload_body, x_hub_signature_256):
+    #     print("❌ Invalid signature - rejected")
+    #     return {"error": "Invalid signature", "status": "rejected"}
+    
+    print("✓ Signature verification DISABLED (testing mode)")
+    
+    try:
+        data = json.loads(payload_body)
+    except Exception as e:
+        print(f"❌ Failed to parse JSON: {e}")
+        return {"error": "Invalid JSON", "status": "failed"}
+    
+    # Extract information
+    action = data.get("action")
+    pr = data.get("pull_request", {})
+    repo = data.get("repository", {})
+    
+    pr_number = pr.get("number")
+    owner = repo.get("owner", {}).get("login")
+    repo_name = repo.get("name")
+    
+    print(f"Action: {action}")
+    print(f"Repository: {owner}/{repo_name}")
+    print(f"PR Number: #{pr_number}")
+    
+    # Only process new or updated PRs
+    if action not in ["opened", "synchronize"]:
+        print(f"⏭️  Skipping action: {action}")
+        return {"status": "skipped", "reason": f"Not processing {action}"}
+    
+    try:
+        # STEP 1: Get the code diff
+        print("\n📥 STEP 1: Fetching code diff...")
+        code_diff = await get_pr_diff(owner, repo_name, pr_number)
+        
+        # Limit diff size
+        if len(code_diff) > 8000:
+            code_diff = code_diff[:8000] + "\n... (truncated)"
+            print("⚠️  Diff was too large, truncated")
+        
+        print(f"✓ Got {len(code_diff)} characters of code")
+        
+        # STEP 2: Send to Groq for review
+        print("\n🤖 STEP 2: Asking Groq to review...")
+        review = await review_code_with_groq(code_diff)
+        print(f"✓ Got review from Groq")
+        print(f"\nReview:\n{review[:300]}...\n")
+        
+        # STEP 3: Post review on PR
+        print("💬 STEP 3: Posting review on PR...")
+        success = await post_review_comment(owner, repo_name, pr_number, review)
+        
+        if success:
+            print("\n✅ WEBHOOK PROCESSING COMPLETE!")
+            return {
+                "status": "success",
+                "message": "Review posted successfully",
+                "pr": f"{owner}/{repo_name}#{pr_number}"
+            }
+        else:
+            return {
+                "status": "error",
+                "message": "Failed to post review"
+            }
+    
+    except Exception as e:
+        print(f"\n❌ ERROR: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return {
-            "error": "Invalid signature",
-            "status": "rejected"
+            "status": "error",
+            "message": str(e)
         }
-    
-    # Convert to Python dictionary
-    data = json.loads(payload_body)
-    
-    # Extract useful information
-    action = data.get("action")  # "opened", "synchronize", "closed"
-    pr_number = data.get("pull_request", {}).get("number")
-    repo_name = data.get("repository", {}).get("name")
-    repo_owner = data.get("repository", {}).get("owner", {}).get("login")
-    
-    print(f"✓ Webhook received!")
-    print(f"  Action: {action}")
-    print(f"  PR Number: {pr_number}")
-    print(f"  Repository: {repo_owner}/{repo_name}")
-    
-    # For  just acknowledge
-    return {
-        "message": "Webhook processed",
-        "status": "success",
-        "pr_number": pr_number
-    }
-
-#
