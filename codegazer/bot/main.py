@@ -6,6 +6,10 @@ import hashlib
 import json
 import httpx
 import groq
+from datetime import datetime, timedelta
+import time
+from typing import Optional
+import asyncio
 
 load_dotenv()
 
@@ -16,12 +20,55 @@ GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 GITHUB_SECRET = os.getenv("GITHUB_SECRET", "")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
+# Rate limiting
+class RateLimiter:
+    """
+    Controls how many reviews we do per minute
+    
+    Analogy: Like a bouncer at a club
+    Only lets X people in per minute
+    """
+    def __init__(self, max_requests: int = 5, window_seconds: int = 60):
+        self.max_requests = max_requests  # Max 5 requests
+        self.window_seconds = window_seconds  # Per 60 seconds
+        self.requests = []  # Track times of requests
+    
+    async def is_allowed(self) -> bool:
+        """Check if we can make a request"""
+        now = datetime.now()
+        
+        # Remove old requests (outside time window)
+        self.requests = [
+            req_time for req_time in self.requests 
+            if now - req_time < timedelta(seconds=self.window_seconds)
+        ]
+        
+        # Check if we can make another request
+        if len(self.requests) < self.max_requests:
+            self.requests.append(now)
+            return True
+        
+        return False
+    
+    def get_wait_time(self) -> int:
+        """How long to wait before next request allowed"""
+        if not self.requests:
+            return 0
+        
+        oldest = self.requests[0]
+        now = datetime.now()
+        wait = (oldest + timedelta(seconds=self.window_seconds) - now).total_seconds()
+        
+        return max(0, int(wait) + 1)
+
+# Create rate limiter (5 reviews per 60 seconds)
+rate_limiter = RateLimiter(max_requests=5, window_seconds=60)
+
 # Verify keys are loaded
 print("=" * 50)
 print("CHECKING KEYS...")
 print("=" * 50)
 print(f"✓ GITHUB_TOKEN: {'Loaded ✓' if GITHUB_TOKEN else 'MISSING ✗'}")
-print(f"✓ GITHUB_SECRET: {'Loaded ✓' if GITHUB_SECRET else 'NOT SET (disabled for testing)'}")
 print(f"✓ GROQ_API_KEY: {'Loaded ✓' if GROQ_API_KEY else 'MISSING ✗'}")
 print("=" * 50)
 
@@ -30,38 +77,41 @@ def read_root():
     return {
         "message": "Code Review Bot is running!",
         "status": "healthy",
-        "github_token_loaded": bool(GITHUB_TOKEN),
-        "groq_key_loaded": bool(GROQ_API_KEY)
+        "features": ["error_handling", "rate_limiting"]
     }
 
 @app.get("/test-github")
 async def test_github():
-    """Test if our GitHub token works"""
-    headers = {
-        "Authorization": f"token {GITHUB_TOKEN}",
-        "Accept": "application/vnd.github.v3+json"
-    }
-    
-    async with httpx.AsyncClient() as client:
-        response = await client.get(
-            "https://api.github.com/user",
-            headers=headers
-        )
-    
-    if response.status_code == 200:
-        user_data = response.json()
-        return {
-            "status": "success",
-            "message": "GitHub token works!",
-            "user": user_data.get("login"),
-            "name": user_data.get("name")
+    """Test if GitHub token works"""
+    try:
+        headers = {
+            "Authorization": f"token {GITHUB_TOKEN}",
+            "Accept": "application/vnd.github.v3+json"
         }
-    else:
-        return {
-            "status": "error",
-            "message": "GitHub token failed",
-            "error": response.text
-        }
+        
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(
+                "https://api.github.com/user",
+                headers=headers
+            )
+        
+        if response.status_code == 200:
+            user_data = response.json()
+            return {
+                "status": "success",
+                "message": "GitHub token works!",
+                "user": user_data.get("login")
+            }
+        else:
+            return {
+                "status": "error",
+                "message": f"GitHub returned {response.status_code}",
+                "details": response.text[:200]
+            }
+    except httpx.TimeoutException:
+        return {"status": "error", "message": "GitHub API timeout (too slow)"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 
 @app.get("/test-groq")
 def test_groq():
@@ -80,109 +130,182 @@ def test_groq():
             "message": "Groq API works!",
             "response": response.choices[0].message.content
         }
+    except groq.BadRequestError as e:
+        # Model decommissioned
+        return {
+            "status": "error",
+            "message": f"Model error: {str(e)[:100]}",
+            "hint": "Update model name in main.py"
+        }
+    except groq.RateLimitError:
+        return {
+            "status": "error",
+            "message": "Groq rate limit exceeded"
+        }
     except Exception as e:
         return {
             "status": "error",
             "message": str(e)
         }
 
-def verify_github_signature(payload_body, signature):
-    """Verify GitHub webhook signature"""
-    if not signature:
-        return False
-    
-    hash_object = hmac.new(
-        GITHUB_SECRET.encode(),
-        payload_body,
-        hashlib.sha256
-    )
-    expected_signature = "sha256=" + hash_object.hexdigest()
-    
-    return hmac.compare_digest(expected_signature, signature)
-
-
 async def get_pr_diff(owner: str, repo: str, pr_number: int) -> str:
-    """Get the code changes (diff) from a pull request"""
+    """
+    Get code diff from GitHub with error handling
+    
+    Retries up to 3 times if it fails
+    """
+    max_retries = 3
+    retry_delay = 2  # seconds
     
     headers = {
         "Authorization": f"token {GITHUB_TOKEN}",
         "Accept": "application/vnd.github.v3.diff"
     }
     
-    async with httpx.AsyncClient() as client:
-        response = await client.get(
-            f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}",
-            headers=headers
-        )
-    
-    if response.status_code == 200:
-        return response.text
-    else:
-        raise Exception(f"Failed to get diff: {response.text}")
+    for attempt in range(max_retries):
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                response = await client.get(
+                    f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}",
+                    headers=headers
+                )
+            
+            if response.status_code == 200:
+                print(f"✓ Got code diff (attempt {attempt + 1})")
+                return response.text
+            
+            elif response.status_code == 404:
+                raise Exception("PR not found (404)")
+            
+            elif response.status_code == 401:
+                raise Exception("Authentication failed - check GitHub token")
+            
+            elif response.status_code >= 500:
+                # Server error - try again
+                print(f"⚠️  GitHub server error ({response.status_code}), retrying...")
+                await asyncio.sleep(retry_delay)
+                continue
+            
+            else:
+                raise Exception(f"GitHub API returned {response.status_code}")
+        
+        except httpx.TimeoutException:
+            print(f"⚠️  Timeout fetching diff (attempt {attempt + 1}/{max_retries})")
+            if attempt < max_retries - 1:
+                await asyncio.sleep(retry_delay)
+            else:
+                raise Exception("Timeout: Could not fetch code diff after 3 attempts")
+        
+        except Exception as e:
+            if attempt < max_retries - 1:
+                print(f"⚠️  Error: {str(e)}, retrying...")
+                await asyncio.sleep(retry_delay)
+            else:
+                raise
 
-async def review_code_with_groq(code_diff: str) -> str:
-    """Send code diff to Groq and get review"""
+async def review_code_with_groq(code_diff: str) -> Optional[str]:
+    """
+    Send code to Groq with error handling
     
-    client = groq.Groq(api_key=GROQ_API_KEY)
-    
-    # IMPORTANT: Include the actual code_diff in the prompt!
-    prompt = f"""You are an expert code reviewer. Review this code diff and provide constructive feedback.
+    Returns review text or None if fails
+    """
+    try:
+        client = groq.Groq(api_key=GROQ_API_KEY)
+        
+        # Shorten prompt to save tokens
+        prompt = f"""Review this code diff. Find 3-5 issues:
 
-Focus on:
-1. Bugs or potential errors
-2. Code style and readability
-3. Performance improvements
-4. Security issues
-5. Best practices
-
-Keep your review concise and precise  (5-8 points max).
-Format each point clearly.
-The review should not be very lengthy and should be orgaised.(should not provide unnecessary sentences just only the issues pointwise)
-Make the review as short as possible
-Code diff to review:
 ```diff
 {code_diff}
 ```
 
-Please provide your review:"""
+Focus: bugs, security, performance. Be brief."""
+        
+        response = client.chat.completions.create(
+            model="qwen/qwen3-32b",
+            max_tokens=800,
+            messages=[
+                {"role": "user", "content": prompt}
+            ],
+            timeout=30.0  # 30 second timeout
+        )
+        
+        review = response.choices[0].message.content
+        print(f"✓ Got review from Groq ({len(review)} chars)")
+        return review
     
-    response = client.chat.completions.create(
-        model="qwen/qwen3-32b",
-        max_tokens=1000,
-        messages=[
-            {"role": "user", "content": prompt}
-        ]
-    )
+    except groq.RateLimitError:
+        print("❌ Groq rate limited - too many requests")
+        return None
     
-    return response.choices[0].message.content
+    except groq.BadRequestError as e:
+        error_msg = str(e)
+        if "model" in error_msg.lower() and "decommissioned" in error_msg.lower():
+            print("❌ Model decommissioned - update model name")
+        else:
+            print(f"❌ Bad request: {error_msg[:100]}")
+        return None
+    
+    except groq.APIConnectionError:
+        print("❌ Cannot connect to Groq API")
+        return None
+    
+    except Exception as e:
+        print(f"❌ Groq error: {str(e)[:100]}")
+        return None
 
-async def post_review_comment(owner: str, repo: str, pr_number: int, review: str):
-    """Post the review as a comment on the PR"""
+async def post_review_comment(owner: str, repo: str, pr_number: int, review: str) -> bool:
+    """
+    Post review with error handling
     
-    headers = {
-        "Authorization": f"token {GITHUB_TOKEN}",
-        "Accept": "application/vnd.github.v3+json"
-    }
-    
-    comment_body = f"""🤖 **Automated Code Review**
+    Returns True if successful
+    """
+    try:
+        headers = {
+            "Authorization": f"token {GITHUB_TOKEN}",
+            "Accept": "application/vnd.github.v3+json"
+        }
+        
+        comment_body = f"""🤖 **Automated Code Review**
 
 {review}
 
 ---
 *This review was generated by Code Review Bot*"""
+        
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.post(
+                f"https://api.github.com/repos/{owner}/{repo}/issues/{pr_number}/comments",
+                headers=headers,
+                json={"body": comment_body}
+            )
+        
+        if response.status_code == 201:
+            print(f"✓ Review posted successfully!")
+            return True
+        
+        elif response.status_code == 401:
+            print("❌ Authentication failed - check GitHub token")
+            return False
+        
+        elif response.status_code == 403:
+            print("❌ Permission denied - bot can't post comments")
+            return False
+        
+        elif response.status_code == 404:
+            print("❌ PR not found")
+            return False
+        
+        else:
+            print(f"❌ Failed to post ({response.status_code}): {response.text[:100]}")
+            return False
     
-    async with httpx.AsyncClient() as client:
-        response = await client.post(
-            f"https://api.github.com/repos/{owner}/{repo}/issues/{pr_number}/comments",
-            headers=headers,
-            json={"body": comment_body}
-        )
+    except httpx.TimeoutException:
+        print("❌ Timeout posting review")
+        return False
     
-    if response.status_code == 201:
-        print(f"✓ Review posted on {owner}/{repo}#{pr_number}")
-        return True
-    else:
-        print(f"✗ Failed to post review: {response.text}")
+    except Exception as e:
+        print(f"❌ Error posting review: {str(e)[:100]}")
         return False
 
 @app.post("/webhook")
@@ -190,86 +313,128 @@ async def receive_webhook(
     request: Request,
     x_hub_signature_256: str = Header(None)
 ):
-    """Handle GitHub webhook"""
+    """Handle GitHub webhook with full error handling"""
     
     print("\n" + "🔔" * 30)
     print("WEBHOOK RECEIVED!")
     print("🔔" * 30)
     
-    payload_body = await request.body()
-    
-    # SIGNATURE VERIFICATION - DISABLED FOR TESTING
-    # Uncomment this to enable signature verification
-    # if not verify_github_signature(payload_body, x_hub_signature_256):
-    #     print("❌ Invalid signature - rejected")
-    #     return {"error": "Invalid signature", "status": "rejected"}
-    
-    print("✓ Signature verification DISABLED (testing mode)")
-    
     try:
-        data = json.loads(payload_body)
-    except Exception as e:
-        print(f"❌ Failed to parse JSON: {e}")
-        return {"error": "Invalid JSON", "status": "failed"}
-    
-    # Extract information
-    action = data.get("action")
-    pr = data.get("pull_request", {})
-    repo = data.get("repository", {})
-    
-    pr_number = pr.get("number")
-    owner = repo.get("owner", {}).get("login")
-    repo_name = repo.get("name")
-    
-    print(f"Action: {action}")
-    print(f"Repository: {owner}/{repo_name}")
-    print(f"PR Number: #{pr_number}")
-    
-    # Only process new or updated PRs
-    if action not in ["opened", "synchronize"]:
-        print(f"⏭️  Skipping action: {action}")
-        return {"status": "skipped", "reason": f"Not processing {action}"}
-    
-    try:
-        # STEP 1: Get the code diff
-        print("\n📥 STEP 1: Fetching code diff...")
-        code_diff = await get_pr_diff(owner, repo_name, pr_number)
+        payload_body = await request.body()
         
-        # Limit diff size
-        if len(code_diff) > 8000:
-            code_diff = code_diff[:8000] + "\n... (truncated)"
-            print("⚠️  Diff was too large, truncated")
+        try:
+            data = json.loads(payload_body)
+        except json.JSONDecodeError:
+            print("❌ Invalid JSON in webhook")
+            return {"error": "Invalid JSON", "status": "failed"}
         
-        print(f"✓ Got {len(code_diff)} characters of code")
+        # Extract information
+        action = data.get("action")
+        pr = data.get("pull_request", {})
+        repo = data.get("repository", {})
         
-        # STEP 2: Send to Groq for review
-        print("\n🤖 STEP 2: Asking Groq to review...")
-        review = await review_code_with_groq(code_diff)
-        print(f"✓ Got review from Groq")
-        print(f"\nReview:\n{review[:300]}...\n")
+        pr_number = pr.get("number")
+        owner = repo.get("owner", {}).get("login")
+        repo_name = repo.get("name")
         
-        # STEP 3: Post review on PR
-        print("💬 STEP 3: Posting review on PR...")
-        success = await post_review_comment(owner, repo_name, pr_number, review)
+        print(f"Action: {action}")
+        print(f"Repository: {owner}/{repo_name}")
+        print(f"PR Number: #{pr_number}")
         
-        if success:
-            print("\n✅ WEBHOOK PROCESSING COMPLETE!")
+        # Validate required fields
+        if not all([action, pr_number, owner, repo_name]):
+            print("⚠️  Missing required fields in webhook")
+            return {"status": "skipped", "reason": "Invalid webhook data"}
+        
+        # Only process new or updated PRs
+        if action not in ["opened", "synchronize"]:
+            print(f"⏭️  Skipping action: {action}")
+            return {"status": "skipped"}
+        
+        # CHECK RATE LIMIT
+        print("\n⏱️  Checking rate limit...")
+        if not await rate_limiter.is_allowed():
+            wait_time = rate_limiter.get_wait_time()
+            print(f"⚠️  Rate limited! Wait {wait_time} seconds")
             return {
-                "status": "success",
-                "message": "Review posted successfully",
-                "pr": f"{owner}/{repo_name}#{pr_number}"
+                "status": "rate_limited",
+                "message": f"Please wait {wait_time} seconds before next review",
+                "wait_seconds": wait_time
             }
-        else:
+        
+        print("✓ Rate limit OK (within limits)")
+        
+        try:
+            # STEP 1: Get code diff
+            print("\n📥 STEP 1: Fetching code diff...")
+            code_diff = await get_pr_diff(owner, repo_name, pr_number)
+            
+            if not code_diff or len(code_diff) < 10:
+                print("⚠️  No meaningful code changes to review")
+                return {
+                    "status": "skipped",
+                    "reason": "No code changes found"
+                }
+            
+            # Limit size
+            if len(code_diff) > 8000:
+                code_diff = code_diff[:8000] + "\n... (truncated)"
+            
+            print(f"✓ Got {len(code_diff)} characters")
+            
+            # STEP 2: Get review from Groq
+            print("\n🤖 STEP 2: Asking Groq to review...")
+            review = await review_code_with_groq(code_diff)
+            
+            if not review:
+                print("⚠️  Could not get review from Groq")
+                # Post a comment saying we failed
+                await post_review_comment(
+                    owner, repo_name, pr_number,
+                    "Sorry! I couldn't review this code right now. Please try again later."
+                )
+                return {
+                    "status": "failed",
+                    "message": "Groq API failed"
+                }
+            
+            # STEP 3: Post review
+            print("\n💬 STEP 3: Posting review...")
+            success = await post_review_comment(owner, repo_name, pr_number, review)
+            
+            if success:
+                print("\n✅ COMPLETE!")
+                return {
+                    "status": "success",
+                    "message": "Review posted",
+                    "pr": f"{owner}/{repo_name}#{pr_number}"
+                }
+            else:
+                return {
+                    "status": "failed",
+                    "message": "Could not post review"
+                }
+        
+        except Exception as e:
+            print(f"\n❌ ERROR: {str(e)}")
+            
+            # Try to post error message on PR
+            try:
+                await post_review_comment(
+                    owner, repo_name, pr_number,
+                    f"Error reviewing code: {str(e)[:100]}\n\nPlease check the bot logs."
+                )
+            except:
+                pass
+            
             return {
                 "status": "error",
-                "message": "Failed to post review"
+                "message": str(e)[:100]
             }
     
     except Exception as e:
-        print(f"\n❌ ERROR: {str(e)}")
-        import traceback
-        traceback.print_exc()
+        print(f"❌ CRITICAL ERROR: {str(e)}")
         return {
-            "status": "error",
-            "message": str(e)
+            "status": "critical_error",
+            "message": str(e)[:100]
         }
